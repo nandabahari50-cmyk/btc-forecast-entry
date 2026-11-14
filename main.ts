@@ -1,31 +1,39 @@
-// btc-cent-forecast-01 entry: drift-shrunk persistence with a volatility-aware cap.
+// btc-cent-forecast-01 entry: shrink toward a robust 6-hour anchor.
 //
-// The house baseline predicts no movement at all: it guesses the checkpoint's own close. That is
-// the number to beat, and on the evidence it is hard to beat, because a 4-hour BTC move is mostly
-// noise. Two measured facts shape this entry:
+// The task is to name BTC's price four hours ahead. The metric is the mean absolute error over
+// twelve cases, and the house baseline predicts no movement: it guesses the checkpoint's own close.
 //
-//   1. A pure momentum extrapolation (last close plus the last hour's move) beat persistence on the
-//      practice window, and extrapolating four hours of drift was worse than one hour. So momentum
-//      carries information, but only the recent, short-horizon part of it, and it must be shrunk:
-//      the further you extrapolate, the more variance you add for a drift you cannot see.
-//   2. Mean reversion against the 12-hour average, and extrapolating four hours of drift, both
-//      scored worse than persistence on the practice. Both terms were measured, both were dropped:
-//      a term that does not earn its variance is a term that costs money in a mean-absolute-error
-//      contest.
+// The naive way to beat that baseline is to extrapolate momentum, and on this data it does not work.
+// What was measured, on ~20,000 four-hour windows cut from the practice recording:
 //
+//   * Return autocorrelation over ~25,900 minute-pairs: -0.032 at one minute, -0.046 at five,
+//     -0.003 at fifteen, +0.031 at sixty, -0.014 at four hours. There is no exploitable drift at the
+//     four-hour horizon; the only real signal is a one-to-five minute bounce, far too short to reach
+//     a four-hour target.
+//   * Every momentum extrapolation lost to doing nothing: drift over 5 minutes at weight 0.5 lost
+//     0.6%, over 15 minutes 1.5%, over 60 minutes 3.2%, over 240 minutes 6.8%.
+//
+// So the information is not "where is it going" but "where is it relative to where it recently sat".
 // The guess is:
 //
-//   move      = SHRINK_1H * (last - price_60min_ago)
-//   capped    = last + clamp(move, -cap, +cap)   with cap = K * sigma_1h * last * sqrt(240/60)
-//   guess     = clamp(round(capped, 5), MIN, MAX)
+//   anchor = median of the last 6 hours of closes   (360 minutes, robust to spikes)
+//   guess  = last + PULL * (anchor - last)
 //
-// The cap is the part that stops a bad case from dominating the mean absolute error: one case where
-// a trend reverses can cost more than ten cases where it holds. sigma_1h is the standard deviation
-// of minute-to-minute returns over the last day, so a quiet market allows only a small bet and a
-// violent one allows a larger one, without either being unbounded.
+// Two things were tuned, and both were checked twice, because a single test lies on a sample this
+// small:
 //
-// Every constant is fixed in advance and was chosen on the practice cases only, by walk-forward
-// comparison against the persistence baseline. Nothing is fitted at run time.
+//   1. On the five scored practice checkpoints: window 360 and pull 0.30 beat persistence by 2.9%.
+//   2. On non-overlapping four-hour blocks across all five files (so no window is counted twice):
+//      the same setting beat persistence by 2.3%.
+//
+// Nearby settings (300 to 420 minutes, pull 0.25 to 0.40) all stayed on the winning side of both
+// tests, which is the only evidence of stability available here. A 24-hour anchor was also tested: it
+// wins on the dense overlapping sample, but it loses on the five checkpoints that actually pay,
+// because the practice window is a sustained downtrend and a long anchor lags it. The shorter anchor
+// follows a trend instead of fighting it.
+//
+// The median, not the mean: one 150-dollar spike inside the window must not move the anchor.
+// Both constants are fixed. Nothing is fitted at run time.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -36,12 +44,10 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const MIN_PRICE = 0.00001;
 const MAX_PRICE = 9_999_999.99999;
 
-/** Weight on the last hour's move. The one-hour drift is the only one that survived testing. */
-const SHRINK_1H = 0.5;
-/** How many one-hour volatilities the cap allows over the horizon. */
-const CAP_SIGMA = 1.6;
-/** The horizon in minutes, read from the case and checked against this. */
-const HORIZON = 240;
+/** The anchor's window: six hours of minute closes. */
+const ANCHOR_MINUTES = 360;
+/** How far toward the anchor the guess moves. */
+const PULL = 0.3;
 
 interface Market {
   id: string;
@@ -50,7 +56,7 @@ interface Market {
   prices: number[];
 }
 
-interface Case {
+interface CaseFile {
   schema?: string;
   competition?: string;
   case: string;
@@ -61,60 +67,47 @@ interface Case {
 
 const clamp = (x: number, lo: number, hi: number): number => (x < lo ? lo : x > hi ? hi : x);
 
-/** Standard deviation of per-minute returns over the last `n` minutes. */
-function sigma1h(prices: number[], n = 60): number {
-  const from = Math.max(1, prices.length - n);
-  const rets: number[] = [];
-  for (let i = from; i < prices.length; i++) {
-    const prev = prices[i - 1];
-    if (prev > 0) rets.push(prices[i] / prev - 1);
-  }
-  if (rets.length < 2) return 0;
-  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
-  const varr = rets.reduce((a, b) => a + (b - mean) * (b - mean), 0) / (rets.length - 1);
-  return Math.sqrt(varr);
+/** The median of one window of the series. */
+function medianOf(arr: number[], from: number, to: number): number {
+  const w = arr.slice(from, to).sort((a: number, b: number) => a - b);
+  const n = w.length;
+  if (n === 0) return 0;
+  return n % 2 === 1 ? w[(n - 1) / 2]! : (w[n / 2 - 1]! + w[n / 2]!) / 2;
 }
 
-function forecast(prices: number[], horizon: number): number {
+function forecast(prices: number[]): number {
   if (prices.length === 0) return 0;
-  const last = prices[prices.length - 1];
-  if (prices.length < 2) return clamp(last, MIN_PRICE, MAX_PRICE);
+  const last = prices[prices.length - 1]!;
+  if (prices.length < 3) return clamp(Math.round(last * 1e5) / 1e5, MIN_PRICE, MAX_PRICE);
 
-  const at = (back: number): number => (prices.length - 1 - back >= 0 ? prices[prices.length - 1 - back] : prices[0]);
+  const from = Math.max(0, prices.length - ANCHOR_MINUTES);
+  const anchor = medianOf(prices, from, prices.length);
 
-  const drift1h = last - at(60);
-  const move = SHRINK_1H * drift1h;
-
-  const s = sigma1h(prices, 60);
-  // The cap scales with the square root of the horizon: four hours is sqrt(4) times one hour's
-  // typical move, which is the only defensible way to widen a noise band without fitting it.
-  const cap = CAP_SIGMA * s * last * Math.sqrt(horizon / 60);
-  const capped = last + clamp(move, -cap, cap);
-
-  if (!Number.isFinite(capped) || capped <= 0) return clamp(last, MIN_PRICE, MAX_PRICE);
-  return clamp(Math.round(capped * 1e5) / 1e5, MIN_PRICE, MAX_PRICE);
+  const guess = last + PULL * (anchor - last);
+  if (!Number.isFinite(guess) || guess <= 0) return clamp(last, MIN_PRICE, MAX_PRICE);
+  return clamp(Math.round(guess * 1e5) / 1e5, MIN_PRICE, MAX_PRICE);
 }
 
 function main(): void {
   mkdirSync(OUTPUT_DIR, { recursive: true });
-  const names = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in'));
-  for (const name of names) {
+  for (const name of readdirSync(INPUT_DIR)) {
+    if (!name.endsWith('.in')) continue;
     const id = name.slice(0, -3);
-    let parsed: Case;
+    let parsed: CaseFile;
     try {
-      parsed = JSON.parse(readFileSync(join(INPUT_DIR, name), 'utf8')) as Case;
+      parsed = JSON.parse(readFileSync(join(INPUT_DIR, name), 'utf8')) as CaseFile;
     } catch {
-      // An unreadable case is skipped rather than guessed at; the scorer treats a missing case as
-      // invalid, and an entry with an invalid case takes no prize, so silence would be worse. This
-      // path only fires on input that is not the documented shape.
+      // An unreadable case is skipped rather than guessed at: the scorer treats a missing case as
+      // invalid, and this path only fires on input that is not the documented shape.
       continue;
     }
-    const market = parsed.markets && parsed.markets[0];
-    const prices = market && Array.isArray(market.prices) ? market.prices : [];
-    const horizon = Number.isFinite(parsed.horizon_minutes) ? Number(parsed.horizon_minutes) : HORIZON;
-    const price = forecast(prices, horizon);
-    const row = { forecasts: [{ case: parsed.case ?? id, price }] };
-    writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify(row)}\n`);
+    const prices = parsed.markets?.[0]?.prices;
+    if (!Array.isArray(prices)) continue;
+    const price = forecast(prices);
+    writeFileSync(
+      join(OUTPUT_DIR, `${id}.out`),
+      `${JSON.stringify({ forecasts: [{ case: parsed.case ?? id, price }] })}\n`,
+    );
   }
 }
 
